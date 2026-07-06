@@ -17,11 +17,16 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from kernels import get_kernel
 cap = torch.cuda.get_device_capability()
-# varunneal's FA3 is Hopper only, use kernels-community on non-Hopper GPUs
-repo = "varunneal/flash-attention-3" if cap == (9, 0) else "kernels-community/flash-attn3"
-fa3 = get_kernel(repo).flash_attn_interface
+HAS_BF16 = torch.cuda.is_bf16_supported(including_emulation=False)  # native bf16 needs Ampere+ (sm_80)
+CAN_COMPILE = cap >= (7, 0)                # Triton/torch.compile needs Volta+ (sm_70)
+HAS_FA3 = cap >= (8, 0)                    # FA3 kernels need Ampere+; SDPA fallback below
+
+if HAS_FA3:
+    from kernels import get_kernel
+    # varunneal's FA3 is Hopper only, use kernels-community on non-Hopper GPUs
+    repo = "varunneal/flash-attention-3" if cap == (9, 0) else "kernels-community/flash-attn3"
+    fa3 = get_kernel(repo).flash_attn_interface
 
 from prepare import MAX_SEQ_LEN, TIME_BUDGET, Tokenizer, make_dataloader, evaluate_bpb
 
@@ -47,6 +52,29 @@ def norm(x):
 def has_ve(layer_idx, n_layer):
     """Returns True if layer should have Value Embedding (alternating, last always included)."""
     return layer_idx % 2 == (n_layer - 1) % 2
+
+
+_sdpa_window_masks = {}
+
+def attention(q, k, v, window_size):
+    """FA3 when available, otherwise SDPA with an equivalent banded-causal mask.
+    q, k, v are [B, T, n_head, head_dim] (FA3 layout)."""
+    if HAS_FA3:
+        return fa3.flash_attn_func(q, k, v, causal=True, window_size=window_size)
+    q, k, v = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
+    if k.size(1) != q.size(1):  # GQA: expand kv heads for SDPA
+        rep = q.size(1) // k.size(1)
+        k, v = k.repeat_interleave(rep, dim=1), v.repeat_interleave(rep, dim=1)
+    T, window = q.size(2), window_size[0]
+    if window >= T:
+        y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+    else:
+        key = (T, window)
+        if key not in _sdpa_window_masks:
+            rel = torch.arange(T, device=q.device).view(-1, 1) - torch.arange(T, device=q.device).view(1, -1)
+            _sdpa_window_masks[key] = (rel >= 0) & (rel <= window)
+        y = F.scaled_dot_product_attention(q, k, v, attn_mask=_sdpa_window_masks[key])
+    return y.transpose(1, 2)
 
 
 def apply_rotary_emb(x, cos, sin):
@@ -90,7 +118,7 @@ class CausalSelfAttention(nn.Module):
         q, k = apply_rotary_emb(q, cos, sin), apply_rotary_emb(k, cos, sin)
         q, k = norm(q), norm(k)
 
-        y = fa3.flash_attn_func(q, k, v, causal=True, window_size=window_size)
+        y = attention(q, k, v, window_size)
         y = y.contiguous().view(B, T, -1)
         y = self.c_proj(y)
         return y
@@ -175,10 +203,11 @@ class GPT(nn.Module):
         head_dim = self.config.n_embd // self.config.n_head
         cos, sin = self._precompute_rotary_embeddings(self.rotary_seq_len, head_dim)
         self.cos, self.sin = cos, sin
-        # Cast embeddings to bf16
-        self.transformer.wte.to(dtype=torch.bfloat16)
-        for ve in self.value_embeds.values():
-            ve.to(dtype=torch.bfloat16)
+        # Cast embeddings to bf16 (skip on GPUs without native bf16, e.g. Pascal)
+        if HAS_BF16:
+            self.transformer.wte.to(dtype=torch.bfloat16)
+            for ve in self.value_embeds.values():
+                ve.to(dtype=torch.bfloat16)
 
     def _precompute_rotary_embeddings(self, seq_len, head_dim, base=10000, device=None):
         if device is None:
@@ -188,7 +217,8 @@ class GPT(nn.Module):
         t = torch.arange(seq_len, dtype=torch.float32, device=device)
         freqs = torch.outer(t, inv_freq)
         cos, sin = freqs.cos(), freqs.sin()
-        cos, sin = cos.bfloat16(), sin.bfloat16()
+        rotary_dtype = torch.bfloat16 if HAS_BF16 else torch.float32
+        cos, sin = cos.to(rotary_dtype), sin.to(rotary_dtype)
         cos, sin = cos[None, :, None, :], sin[None, :, None, :]
         return cos, sin
 
@@ -302,7 +332,6 @@ polar_express_coeffs = [
     (2.3465413258596377, -1.7097828382687081, 0.42323551169305323),
 ]
 
-@torch.compile(dynamic=False, fullgraph=True)
 def adamw_step_fused(p, grad, exp_avg, exp_avg_sq, step_t, lr_t, beta1_t, beta2_t, eps_t, wd_t):
     p.mul_(1 - lr_t * wd_t)
     exp_avg.lerp_(grad, 1 - beta1_t)
@@ -313,15 +342,14 @@ def adamw_step_fused(p, grad, exp_avg, exp_avg_sq, step_t, lr_t, beta1_t, beta2_
     step_size = lr_t / bias1
     p.add_(exp_avg / denom, alpha=-step_size)
 
-@torch.compile(dynamic=False, fullgraph=True)
 def muon_step_fused(stacked_grads, stacked_params, momentum_buffer, second_momentum_buffer,
                     momentum_t, lr_t, wd_t, beta2_t, ns_steps, red_dim):
     # Nesterov momentum
     momentum = momentum_t.to(stacked_grads.dtype)
     momentum_buffer.lerp_(stacked_grads, 1 - momentum)
     g = stacked_grads.lerp_(momentum_buffer, momentum)
-    # Polar express orthogonalization
-    X = g.bfloat16()
+    # Polar express orthogonalization (bf16 matmuls need Ampere+; fp32 otherwise)
+    X = g.bfloat16() if HAS_BF16 else g.float()
     X = X / (X.norm(dim=(-2, -1), keepdim=True) * 1.02 + 1e-6)
     if g.size(-2) > g.size(-1):
         for a, b, c in polar_express_coeffs[:ns_steps]:
@@ -351,6 +379,11 @@ def muon_step_fused(stacked_grads, stacked_params, momentum_buffer, second_momen
     wd = wd_t.to(g.dtype)
     mask = (g * stacked_params) >= 0
     stacked_params.sub_(lr * g + lr * wd * stacked_params * mask)
+
+
+if CAN_COMPILE:
+    adamw_step_fused = torch.compile(adamw_step_fused, dynamic=False, fullgraph=True)
+    muon_step_fused = torch.compile(muon_step_fused, dynamic=False, fullgraph=True)
 
 
 class MuonAdamW(torch.optim.Optimizer):
@@ -432,10 +465,21 @@ class MuonAdamW(torch.optim.Optimizer):
 # Model architecture
 ASPECT_RATIO = 64       # model_dim = depth * ASPECT_RATIO
 HEAD_DIM = 128          # target head dimension for attention
-WINDOW_PATTERN = "SSSL" # sliding window pattern: L=full, S=half context
+
+# Size/pattern knobs differ by GPU class, per the README's small-platform guidance
+# (upstream H100 defaults on Ampere+; scaled-down values for older/smaller GPUs).
+if cap >= (8, 0):
+    WINDOW_PATTERN = "SSSL" # sliding window pattern: L=full, S=half context
+    TOTAL_BATCH_SIZE = 2**19 # ~524K tokens per optimizer step
+    DEPTH = 8               # number of transformer layers
+    DEVICE_BATCH_SIZE = 128 # per-device batch size (reduce if OOM)
+else:
+    WINDOW_PATTERN = "L"    # banded attention is inefficient without FA3
+    TOTAL_BATCH_SIZE = 2**14 # ~16K tokens per optimizer step
+    DEPTH = 4               # number of transformer layers
+    DEVICE_BATCH_SIZE = 32  # per-device batch size (reduce if OOM)
 
 # Optimization
-TOTAL_BATCH_SIZE = 2**19 # ~524K tokens per optimizer step
 EMBEDDING_LR = 0.6      # learning rate for token embeddings (Adam)
 UNEMBEDDING_LR = 0.004  # learning rate for lm_head (Adam)
 MATRIX_LR = 0.04        # learning rate for matrix parameters (Muon)
@@ -446,10 +490,6 @@ WARMUP_RATIO = 0.0      # fraction of time budget for LR warmup
 WARMDOWN_RATIO = 0.5    # fraction of time budget for LR warmdown
 FINAL_LR_FRAC = 0.0     # final LR as fraction of initial
 
-# Model size
-DEPTH = 8               # number of transformer layers
-DEVICE_BATCH_SIZE = 128  # per-device batch size (reduce if OOM)
-
 # ---------------------------------------------------------------------------
 # Setup: tokenizer, model, optimizer, dataloader
 # ---------------------------------------------------------------------------
@@ -459,7 +499,7 @@ torch.manual_seed(42)
 torch.cuda.manual_seed(42)
 torch.set_float32_matmul_precision("high")
 device = torch.device("cuda")
-autocast_ctx = torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16)
+autocast_ctx = torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=HAS_BF16)
 H100_BF16_PEAK_FLOPS = 989.5e12
 
 tokenizer = Tokenizer.from_directory()
@@ -505,7 +545,8 @@ optimizer = model.setup_optimizer(
     weight_decay=WEIGHT_DECAY,
 )
 
-model = torch.compile(model, dynamic=False)
+if CAN_COMPILE:
+    model = torch.compile(model, dynamic=False)
 
 train_loader = make_dataloader(tokenizer, DEVICE_BATCH_SIZE, MAX_SEQ_LEN, "train")
 x, y, epoch = next(train_loader)  # prefetch first batch

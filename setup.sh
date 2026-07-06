@@ -1,32 +1,22 @@
 #!/bin/bash
+# One-time setup + smoke test for this small-GPU fork of autoresearch.
+# Small-platform constants live directly in prepare.py (MAX_SEQ_LEN, VOCAB_SIZE,
+# EVAL_TOKENS); train.py auto-detects GPU capability (FA3/bf16/compile vs.
+# SDPA/fp32/eager fallbacks). No file patching needed.
 set -e
 
-TRAINFILE="train.py"
-
-if [ ! -f "$TRAINFILE" ]; then
+if [ ! -f "train.py" ]; then
   echo "ERROR: Run this from inside the autoresearch directory"
   exit 1
 fi
 
-echo "=== Current values ==="
-grep -n "vocab_size\|MAX_SEQ_LEN\|batch_size" $TRAINFILE
-
-echo ""
-echo "=== Applying changes ==="
-sed -i 's/vocab_size\s*=\s*[0-9]*/vocab_size = 2048/' $TRAINFILE
-sed -i 's/MAX_SEQ_LEN\s*=\s*[0-9]*/MAX_SEQ_LEN = 512/' $TRAINFILE
-
-echo "New values:"
-grep -n "vocab_size\|MAX_SEQ_LEN\|batch_size" $TRAINFILE
-
-echo ""
 echo "=== Installing dependencies ==="
 uv sync
 
 echo ""
-echo "=== Preparing data ==="
+echo "=== Preparing data (downloads shards + trains tokenizer on first run) ==="
 uv run prepare.py
 
 echo ""
-echo "=== Running smoke test ==="
+echo "=== Running smoke test (5-minute training run + eval) ==="
 uv run train.py

@@ -27,9 +27,11 @@ import torch
 # Constants (fixed, do not modify)
 # ---------------------------------------------------------------------------
 
-MAX_SEQ_LEN = 512
+# Small-GPU fork: upstream values are MAX_SEQ_LEN=2048, EVAL_TOKENS=40*524288.
+# Lowered per the README's small-platform guidance (GTX 1060 6GB).
+MAX_SEQ_LEN = 512        # context length
 TIME_BUDGET = 300        # training time budget in seconds (5 minutes)
-EVAL_TOKENS = 40 * 524288  # number of tokens for val eval
+EVAL_TOKENS = 4 * 524288  # number of tokens for val eval
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -42,7 +44,7 @@ BASE_URL = "https://huggingface.co/datasets/karpathy/climbmix-400b-shuffle/resol
 MAX_SHARD = 6542 # the last datashard is shard_06542.parquet
 VAL_SHARD = MAX_SHARD  # pinned validation shard (shard_06542)
 VAL_FILENAME = f"shard_{VAL_SHARD:05d}.parquet"
-VOCAB_SIZE = 8192
+VOCAB_SIZE = 2048  # upstream: 8192; lowered per README small-platform guidance
 
 # BPE split pattern (GPT-4 style, with \p{N}{1,2} instead of {1,3})
 SPLIT_PATTERN = r"""'(?i:[sdmt]|ll|ve|re)|[^\r\n\p{L}\p{N}]?+\p{L}+|\p{N}{1,2}| ?[^\s\p{L}\p{N}]++[\r\n]*|\s*[\r\n]|\s+(?!\S)|\s+"""
